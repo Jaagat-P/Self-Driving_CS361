@@ -27,7 +27,7 @@ from planners.dataloader import ScenarioData
 from planners.planner_result import PlannerResult
 
 
-PREDICTION_COLORS = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12"]
+PREDICTION_COLORS = ["#00e5ff", "#ffea00", "#aa00ff", "#ff6d00", "#ffffff", "#76ff03"]
 MODE_LABELS = ["Const. velocity", "Braking", "Lane change L", "Lane change R"]
 
 
@@ -77,20 +77,33 @@ def _draw_ego(ax, ego):
 def plot_trajectory(scenario, result, collapsed_obs=None):
     # ego trajectory + collapsed obstacle trajectories on the road
     fig, ax = plt.subplots(figsize=(14, 9))
-    _draw_road(ax, scenario)
+    _draw_road(ax, scenario, skip_obstacles=True)
 
     ego = result.ego_trajectory
     _draw_ego(ax, ego)
 
     # draw the collapsed (mean or worst-case) obstacle paths
+    # only show the ones closest to ego so it's not cluttered
     if collapsed_obs is not None:
-        for i, (obs_id, positions) in enumerate(collapsed_obs.items()):
+        ranked = _rank_obstacles_by_proximity(ego, scenario.obstacle_predictions)
+        nearby_ids = [obs_id for obs_id, _ in ranked[:6]]
+
+        for i, obs_id in enumerate(nearby_ids):
+            if obs_id not in collapsed_obs:
+                continue
+            positions = collapsed_obs[obs_id]
             color = PREDICTION_COLORS[i % len(PREDICTION_COLORS)]
             ax.plot(positions[:, 0], positions[:, 1], "--", color=color,
-                    linewidth=1.5, alpha=0.7, label=f"Obs {obs_id} (collapsed)")
-            ax.plot(positions[0, 0], positions[0, 1], "o", color=color, markersize=5)
-            if i >= 9:
-                break
+                    linewidth=3.0, alpha=0.9, zorder=9, label=f"Obs {obs_id} (collapsed)")
+            ax.plot(positions[0, 0], positions[0, 1], "o", color=color,
+                    markersize=8, zorder=9, markeredgecolor="black", markeredgewidth=1)
+            # label at the start position
+            ax.annotate(f"Obs {obs_id}", xy=(positions[0, 0], positions[0, 1]),
+                        fontsize=7, fontweight="bold", color="black",
+                        ha="center", va="bottom",
+                        xytext=(0, 8), textcoords="offset points",
+                        bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.8),
+                        zorder=15)
 
     ax.set_title(f"{result.method} — {scenario.scenario_id}\n"
                  f"cost={result.cost:.2f}  min_dist={result.min_obstacle_distance:.2f}m  "
