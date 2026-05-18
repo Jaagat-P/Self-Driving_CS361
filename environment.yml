@@ -1,0 +1,16 @@
+name: selfdriving-cs361
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - numpy
+  - matplotlib
+  - scipy
+  - pip
+
+  - pip:
+      - commonroad-io        # CommonRoad scenario loading + visualization
+      - cma                  # CMA-ES optimizer (gradient-free baseline)
