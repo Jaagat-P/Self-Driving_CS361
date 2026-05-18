@@ -1,4 +1,85 @@
-# Self-Driving CS361 – Environment Setup
+# Self-Driving CS361 – Chance-Constrained Stochastic Trajectory Optimization
+
+## System Architecture
+
+Here is how all components interact at runtime:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                          dataloader.py                              │
+│                                                                     │
+│  load_scenarios("scenarios/")                                       │
+│    ├── reads CommonRoad XML files                                   │
+│    ├── extracts ego_initial_state  ──────────────────────────────┐  │
+│    ├── extracts lanelet_network  (for lane-deviation cost d_t)   │  │
+│    └── calls predictor.py ──────────────────────────────────┐    │  │
+│                                                             │    │  │
+│         returns ScenarioData { obstacle_predictions,        │    │  │
+│                                ego_initial_state,           │    │  │
+│                                lanelet_network, dt, T }     │    │  │
+└─────────────────────────────────────────────────────────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────┐
+│        predictor.py          │
+│                              │
+│  For each obstacle, produce  │
+│  K predicted futures:        │
+│   k=0  constant velocity     │
+│   k=1  braking               │
+│   k=2  lane change left      │
+│   k=3  lane change right     │
+│                              │
+│  output: (K, T, 2) per obs   │
+└──────────────────────────────┘
+                   │
+                   │  ScenarioData flows into optimizer
+                   ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                         optimizer  (coming soon)                    │
+│                                                                     │
+│  decision variable:  u  of shape (T, 2)  = [accel, steer] per step │
+│                                                                     │
+│  each iteration:                                                    │
+│    1. vehicle_dynamics.rollout(ego_initial_state, u)                │
+│          → ego trajectory  (T+1, 4)   [x, y, ψ, v]                 │
+│                                                                     │
+│    2. cost_functions.compute(ego_trajectory,                        │
+│                              obstacle_predictions,                  │
+│                              lanelet_network)                       │
+│          → J(u) = (1/K) Σ_k Σ_t ( a_t² + κ·j_t² + ρ·d_t² )       │
+│                                                                     │
+│    3. collision_check(ego_trajectory, obstacle_predictions)         │
+│          → chance constraint: (1/K) Σ_k 1(collision_k) ≤ ε        │
+│                                                                     │
+│    4. update u  →  repeat until converged                           │
+│                                                                     │
+│  Three planner variants run the same loop with different inputs:    │
+│    plan-on-mean   →  K=1, use mean obstacle position per step       │
+│    worst-case     →  K=1, use most dangerous obstacle position      │
+│    stochastic     →  K=4, all predicted futures (ours)              │
+│                                                                     │
+│  Two optimizer backends:                                            │
+│    SQP    (scipy.optimize, trust-region, needs smooth gradients)    │
+│    CMA-ES (gradient-free, handles discontinuous collision cost)     │
+└─────────────────────────────────────────────────────────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────┐
+│        evaluation            │
+│                              │
+│  per scenario, per planner:  │
+│  - collision rate            │
+│  - completion rate           │
+│  - expected cost J(u*)       │
+│  - runtime                   │
+│  - min obstacle distance     │
+└──────────────────────────────┘
+```
+
+---
+
+## Environment Setup
 
 ## Prerequisites
 
@@ -62,14 +143,14 @@ arr    = states_to_array(states)                # (51, 4) numpy array: x, y, psi
 
 `rollout` only moves the **ego vehicle** — obstacles are external. The optimizer proposes a `(T, 2)` control sequence, `rollout` turns it into a physical trajectory, and then the cost function checks that trajectory against the obstacle positions at each time step.
 
-**How to test (no scenario file needed):**
+**How to test (no scenario file needed, run from repo root):**
 
 ```bash
-cd planners
-python vehicle_dynamics.py
+conda activate selfdriving-cs361
+python -m planners.vehicle_dynamics
 ```
 
-Runs three built-in tests (straight line, left turn, acceleration from rest) and prints expected vs. actual values. -- All tests passed.
+Runs three built-in tests (straight line, left turn, acceleration from rest) and prints expected vs. actual values.
 
 ---
 
