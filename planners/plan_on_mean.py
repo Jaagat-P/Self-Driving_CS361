@@ -1,10 +1,8 @@
-"""
-Plan-on-Mean trajectory planner.
-
-Collapses K obstacle prediction modes into a single mean trajectory per
-obstacle, then optimizes the ego control sequence against that deterministic
-prediction.  Two backends: SQP (scipy SLSQP) and CMA-ES.
-"""
+# plan-on-mean trajectory planner
+#
+# collapses K obstacle prediction modes into one mean trajectory per obstacle,
+# then optimizes the ego controls against that single deterministic prediction
+# two solver backends: SQP (scipy SLSQP) and CMA-ES
 
 from __future__ import annotations
 
@@ -31,83 +29,78 @@ RHO = 1.0
 COLLISION_WEIGHT = 1000.0
 
 
-def _collapse_mean(obstacle_predictions: dict[int, np.ndarray]
-                   ) -> dict[int, np.ndarray]:
-    """Average K prediction modes into one (T, 2) trajectory per obstacle."""
+def _collapse_mean(obstacle_predictions):
+    # average K prediction modes into one (T, 2) trajectory per obstacle
     return {
         obs_id: preds.mean(axis=0)
         for obs_id, preds in obstacle_predictions.items()
     }
 
 
-def _build_bounds(T: int, params: VehicleParams) -> list[tuple[float, float]]:
-    """Box bounds for the flattened (2T,) decision variable [a0, d0, a1, d1, ...]."""
+def _build_bounds(horizon, params):
+    # box bounds for flattened decision variable [a0, d0, a1, d1, ...]
     bounds = []
-    for _ in range(T):
+    for _ in range(horizon):
         bounds.append((params.min_accel, params.max_accel))
         bounds.append((-params.max_steer, params.max_steer))
     return bounds
 
 
-def _unpack_controls(u_flat: np.ndarray, T: int) -> np.ndarray:
-    """Reshape (2T,) → (T, 2)."""
-    return u_flat.reshape(T, 2)
+def _unpack_controls(controls_flat, horizon):
+    # reshape (2T,) back to (T, 2)
+    return controls_flat.reshape(horizon, 2)
 
 
-def _rollout_from_flat(u_flat: np.ndarray, T: int,
-                       ego_init: VehicleState, dt: float,
-                       params: VehicleParams) -> np.ndarray:
-    """Rollout and return (T+1, 4) state array."""
-    controls = _unpack_controls(u_flat, T)
+def _rollout_from_flat(controls_flat, horizon, ego_init, dt, params):
+    # run the bicycle model forward and return (T+1, 4) state array
+    controls = _unpack_controls(controls_flat, horizon)
     states = rollout(ego_init, controls, dt=dt, params=params)
     return states_to_array(states)
 
 
-# -----------------------------------------------------------------------
 # SQP backend
-# -----------------------------------------------------------------------
-
 def plan_on_mean_sqp(scenario: ScenarioData,
-                     kappa: float = KAPPA,
-                     rho: float = RHO,
-                     safe_radius: float = SAFE_RADIUS,
-                     maxiter: int = 200) -> PlannerResult:
-    T = scenario.T
+                     kappa=KAPPA, rho=RHO,
+                     safe_radius=SAFE_RADIUS,
+                     maxiter=200) -> PlannerResult:
+
+    horizon = scenario.T
     dt = scenario.dt
     ego_init = scenario.ego_initial_state
     params = DEFAULT_PARAMS
 
-    mean_obs = _collapse_mean(scenario.obstacle_predictions)
+    # collapse all K modes into one mean prediction per obstacle
+    mean_obstacles = _collapse_mean(scenario.obstacle_predictions)
 
-    def objective(u_flat):
-        controls = _unpack_controls(u_flat, T)
-        traj = _rollout_from_flat(u_flat, T, ego_init, dt, params)
-        j = driving_cost(controls, dt, kappa)
-        j += rho * lane_deviation_cost(traj, scenario.lanelet_network)
-        return j
+    def objective(controls_flat):
+        controls = _unpack_controls(controls_flat, horizon)
+        traj = _rollout_from_flat(controls_flat, horizon, ego_init, dt, params)
+        cost = driving_cost(controls, dt, kappa)
+        cost += rho * lane_deviation_cost(traj, scenario.lanelet_network)
+        return cost
 
-    def collision_constr(u_flat):
-        traj = _rollout_from_flat(u_flat, T, ego_init, dt, params)
-        return collision_constraint_value(traj, mean_obs, safe_radius)
+    def collision_constr(controls_flat):
+        # SLSQP needs this >= 0 for feasibility
+        traj = _rollout_from_flat(controls_flat, horizon, ego_init, dt, params)
+        return collision_constraint_value(traj, mean_obstacles, safe_radius)
 
-    bounds = _build_bounds(T, params)
-    u0 = np.zeros(2 * T)
+    bounds = _build_bounds(horizon, params)
+    initial_controls = np.zeros(2 * horizon)  # start with zero controls (coast)
 
-    constraints = [{"type": "ineq", "fun": collision_constr}]
-
-    t0 = time.time()
+    start_time = time.time()
     result = scipy.optimize.minimize(
-        objective, u0,
+        objective, initial_controls,
         method="SLSQP",
         bounds=bounds,
-        constraints=constraints,
+        constraints=[{"type": "ineq", "fun": collision_constr}],
         options={"maxiter": maxiter, "ftol": 1e-6, "disp": False},
     )
-    elapsed = time.time() - t0
+    elapsed = time.time() - start_time
 
-    controls = _unpack_controls(result.x, T)
-    traj = _rollout_from_flat(result.x, T, ego_init, dt, params)
-    min_dist = min_obstacle_distance(traj, mean_obs)
+    # extract final trajectory from the best controls found
+    controls = _unpack_controls(result.x, horizon)
+    traj = _rollout_from_flat(result.x, horizon, ego_init, dt, params)
+    min_dist = min_obstacle_distance(traj, mean_obstacles)
 
     return PlannerResult(
         controls=controls,
@@ -121,73 +114,67 @@ def plan_on_mean_sqp(scenario: ScenarioData,
     )
 
 
-# -----------------------------------------------------------------------
 # CMA-ES backend
-# -----------------------------------------------------------------------
-
 def plan_on_mean_cmaes(scenario: ScenarioData,
-                       kappa: float = KAPPA,
-                       rho: float = RHO,
-                       safe_radius: float = SAFE_RADIUS,
-                       collision_weight: float = COLLISION_WEIGHT,
-                       maxfevals: int = 5000,
-                       sigma0: float = 0.5) -> PlannerResult:
-    T = scenario.T
+                       kappa=KAPPA, rho=RHO,
+                       safe_radius=SAFE_RADIUS,
+                       collision_weight=COLLISION_WEIGHT,
+                       maxfevals=5000, sigma0=0.5) -> PlannerResult:
+
+    horizon = scenario.T
     dt = scenario.dt
     ego_init = scenario.ego_initial_state
     params = DEFAULT_PARAMS
 
-    mean_obs = _collapse_mean(scenario.obstacle_predictions)
+    mean_obstacles = _collapse_mean(scenario.obstacle_predictions)
 
-    lower = np.tile([params.min_accel, -params.max_steer], T)
-    upper = np.tile([params.max_accel, params.max_steer], T)
+    # CMA-ES box bounds as [lower_list, upper_list]
+    lower = np.tile([params.min_accel, -params.max_steer], horizon)
+    upper = np.tile([params.max_accel, params.max_steer], horizon)
 
-    def objective(u_flat):
-        u_flat = np.asarray(u_flat)
-        controls = _unpack_controls(u_flat, T)
-        traj = _rollout_from_flat(u_flat, T, ego_init, dt, params)
+    def objective(controls_flat):
+        # CMA-ES is unconstrained, so collisions go in as a big penalty term
+        controls_flat = np.asarray(controls_flat)
+        controls = _unpack_controls(controls_flat, horizon)
+        traj = _rollout_from_flat(controls_flat, horizon, ego_init, dt, params)
         return total_cost(
-            controls, traj, mean_obs, scenario.lanelet_network,
+            controls, traj, mean_obstacles, scenario.lanelet_network,
             dt, kappa, rho, collision_weight, safe_radius,
         )
 
-    u0 = np.zeros(2 * T)
+    initial_controls = np.zeros(2 * horizon)
 
-    opts = {
+    start_time = time.time()
+    es = cma.CMAEvolutionStrategy(initial_controls, sigma0, {
         "maxfevals": maxfevals,
         "bounds": [lower.tolist(), upper.tolist()],
         "verbose": -9,
         "seed": 42,
-    }
-
-    t0 = time.time()
-    es = cma.CMAEvolutionStrategy(u0, sigma0, opts)
+    })
     es.optimize(objective)
-    elapsed = time.time() - t0
+    elapsed = time.time() - start_time
 
-    best = np.asarray(es.result.xbest)
-    controls = _unpack_controls(best, T)
-    traj = _rollout_from_flat(best, T, ego_init, dt, params)
-    min_dist = min_obstacle_distance(traj, mean_obs)
+    # pull out the best solution CMA-ES found
+    best_controls_flat = np.asarray(es.result.xbest)
+    controls = _unpack_controls(best_controls_flat, horizon)
+    traj = _rollout_from_flat(best_controls_flat, horizon, ego_init, dt, params)
+    min_dist = min_obstacle_distance(traj, mean_obstacles)
 
-    cost_val = driving_cost(controls, dt, kappa)
-    cost_val += rho * lane_deviation_cost(traj, scenario.lanelet_network)
+    # recompute cost without the collision penalty for a fair comparison
+    final_cost = driving_cost(controls, dt, kappa)
+    final_cost += rho * lane_deviation_cost(traj, scenario.lanelet_network)
 
     return PlannerResult(
         controls=controls,
         ego_trajectory=traj,
-        cost=cost_val,
+        cost=final_cost,
         min_obstacle_distance=min_dist,
         collision_free=(min_dist >= safe_radius - 0.01),
         runtime_seconds=elapsed,
-        converged=not es.result.xbest is None,
+        converged=es.result.xbest is not None,
         method="plan_on_mean_cmaes",
     )
 
-
-# -----------------------------------------------------------------------
-# CLI
-# -----------------------------------------------------------------------
 
 if __name__ == "__main__":
     import sys
@@ -195,21 +182,21 @@ if __name__ == "__main__":
 
     xml_path = sys.argv[1] if len(sys.argv) > 1 else "scenarios/USA_Lanker-1_1_T-1.xml"
     scenario = load_scenario(xml_path)
-    print(f"Scenario: {scenario.scenario_id}  "
+    print(f"scenario: {scenario.scenario_id}  "
           f"(T={scenario.T}, obstacles={scenario.num_obstacles})\n")
 
-    print("--- Plan-on-Mean SQP ---")
-    r = plan_on_mean_sqp(scenario)
-    print(f"  Cost:         {r.cost:.4f}")
-    print(f"  Min dist:     {r.min_obstacle_distance:.2f} m")
-    print(f"  Collision-free: {r.collision_free}")
-    print(f"  Converged:    {r.converged}")
-    print(f"  Runtime:      {r.runtime_seconds:.2f} s\n")
+    print("plan-on-mean SQP")
+    result = plan_on_mean_sqp(scenario)
+    print(f"  cost:           {result.cost:.4f}")
+    print(f"  min dist:       {result.min_obstacle_distance:.2f} m")
+    print(f"  collision free: {result.collision_free}")
+    print(f"  converged:      {result.converged}")
+    print(f"  runtime:        {result.runtime_seconds:.2f} s\n")
 
-    print("--- Plan-on-Mean CMA-ES ---")
-    r = plan_on_mean_cmaes(scenario)
-    print(f"  Cost:         {r.cost:.4f}")
-    print(f"  Min dist:     {r.min_obstacle_distance:.2f} m")
-    print(f"  Collision-free: {r.collision_free}")
-    print(f"  Converged:    {r.converged}")
-    print(f"  Runtime:      {r.runtime_seconds:.2f} s")
+    print("plan-on-mean CMA-ES")
+    result = plan_on_mean_cmaes(scenario)
+    print(f"  cost:           {result.cost:.4f}")
+    print(f"  min dist:       {result.min_obstacle_distance:.2f} m")
+    print(f"  collision free: {result.collision_free}")
+    print(f"  converged:      {result.converged}")
+    print(f"  runtime:        {result.runtime_seconds:.2f} s")
